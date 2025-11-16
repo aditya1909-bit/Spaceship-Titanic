@@ -1,0 +1,22 @@
+# Core
+pandas
+numpy
+scikit-learn
+scipy
+
+# Viz
+matplotlib
+seaborn
+
+# Kaggle CLI
+kaggle
+
+# Gradient boosting
+xgboost
+lightgbm
+catboost
+
+# Deep learning
+torch
+torchvision
+torchaudio
