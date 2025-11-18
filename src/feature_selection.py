@@ -16,7 +16,7 @@ from sklearn.impute import SimpleImputer
 class FeatureSelectionConfig:
     numerical_features: Sequence[str]
     categorical_features: Sequence[str]
-    poly_degree = 5
+    poly_degree: Optional[int] = 2
     k_best: Optional[int] = 50
     
 class ColumnDropper(BaseEstimator, TransformerMixin):
