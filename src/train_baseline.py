@@ -3,48 +3,54 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 
-from feature_selection import(
-    FeatureSelectionConfig,
-    make_feature_pipeline,
-)
+from feature_selection import FeatureSelectionConfig, make_feature_pipeline, global_feature_engineering
+
 
 def build_models() -> dict[str, object]:
     models: dict[str, object] = {}
-
-    models["rf"] = RandomForestClassifier(
-        n_estimators=400,
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=20,
-        n_jobs=-1,
-        random_state=42,
-    )
-
-    models["gb"] = GradientBoostingClassifier(
-        n_estimators=400,
-        learning_rate=0.05,
-        max_depth=5,
-        random_state=42,
-        min_samples_leaf=20,
+    
+    models["lightgbm"] = LGBMClassifier(
+        n_estimators = 1000,
+        learning_rate = 0.05,
+        num_leaves = 31,
+        objective = 'binary',
+        random_state = 42,
+        verbose = -1,
     )
     
-    models['hgb'] = HistGradientBoostingClassifier(
-        max_iter=500,
+    models["cat"] = CatBoostClassifier(
+        iterations=1000,
         learning_rate=0.05,
-        max_depth=None,
-        min_samples_leaf=20,
-        random_state=42,
+        depth=6,
+        random_seed=42,
+        verbose=False,
     )
-
+    
+    models["xgb"] = XGBClassifier(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=6,
+        random_state=42,
+        eval_metric='logloss',
+    )
+    
     return models
 
 def main() -> None:
     train = pd.read_csv("spaceship-titanic/train.csv")
     test = pd.read_csv("spaceship-titanic/test.csv")
     
+    # 1. Apply Global Engineering FIRST
+    print("Applying global feature engineering...")
+    train, test = global_feature_engineering(train, test)
+    
     y = train["Transported"].astype(int)
     
+    # 2. Update Config with NEW features
     config = FeatureSelectionConfig(
         numerical_features=[
             "Age",
@@ -53,15 +59,23 @@ def main() -> None:
             "ShoppingMall",
             "Spa",
             "VRDeck",
+            "TotalSpending",
+            "GroupSize",
+            "FamilySize",
+            "Num",
+            "CabinRegion",
         ],
         categorical_features=[
             "HomePlanet",
             "CryoSleep",
-            "Cabin",
             "Destination",
             "VIP",
+            "Deck",
+            "Side",
+            "IsSolo",
         ],
-        k_best=80,
+        poly_degree=1,
+        k_best=0, 
     )
     
     pipe = make_feature_pipeline(config, columns_to_drop=["PassengerId", "Name", "Transported"])

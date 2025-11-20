@@ -8,11 +8,13 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from sklearn.model_selection import StratifiedKFold
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from feature_selection import FeatureSelectionConfig, make_feature_pipeline
+from feature_selection import FeatureSelectionConfig, make_feature_pipeline, global_feature_engineering
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -41,8 +43,8 @@ class MLP(nn.Module):
 
         for h in hidden_sizes:
             layers.append(nn.Linear(prev_dim, h))
-            layers.append(nn.ReLU())
             layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.LeakyReLU(negative_slope=0.01))
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             prev_dim = h
@@ -60,6 +62,9 @@ def load_raw_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 
     train_df = pd.read_csv(data_dir / "train.csv")
     test_df = pd.read_csv(data_dir / "test.csv")
+    
+    train_df, test_df = global_feature_engineering(train_df, test_df)
+    
     y = train_df["Transported"].astype(int)
 
     return train_df, test_df, y
@@ -74,18 +79,24 @@ def build_feature_pipeline():
             "ShoppingMall",
             "Spa",
             "VRDeck",
+            "TotalSpending",
+            "GroupSize",
+            "FamilySize",
+            "Num",
+            "CabinRegion",
         ],
         categorical_features=[
             "HomePlanet",
             "CryoSleep",
-            "Cabin",
             "Destination",
             "VIP",
+            "Deck",
+            "Side",
+            "IsSolo",
         ],
-        poly_degree=1,    # no polynomial expansion; NN handles nonlinearity
-        k_best=768,       # keep the 512 most informative features for better generalization
+        poly_degree=1,
+        k_best=0, 
     )
-
     columns_to_drop = ["PassengerId", "Name", "Transported"]
     pipe = make_feature_pipeline(config, columns_to_drop=columns_to_drop)
     return pipe
@@ -207,21 +218,65 @@ def main() -> None:
     print(f"Feature matrix shape: {X_all.shape}")
 
     nn_cfg = NNConfig()
-    train_loader, val_loader = make_loaders(X_all, y, nn_cfg)
+
+    print("Running 5-fold Stratified K-Fold NN Training...")
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_accuracies = []
+    fold_models = []
 
     input_dim = X_all.shape[1]
-    model = MLP(input_dim=input_dim, hidden_sizes=nn_cfg.hidden_sizes, dropout=nn_cfg.dropout)
 
-    print("Training neural network...")
-    model, best_val_acc = train_model(model, train_loader, val_loader, nn_cfg)
-    print(f"Best validation accuracy: {best_val_acc:.4f}")
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_all, y), start=1):
+        print(f"\n===== Fold {fold_idx} =====")
 
-    model.to(DEVICE)
-    model.eval()
-    X_test_t = torch.from_numpy(X_test).float().to(DEVICE)
-    with torch.no_grad():
-        logits = model(X_test_t)
-        probs = torch.sigmoid(logits).cpu().numpy()
+        X_tr = X_all.iloc[train_idx]
+        X_va = X_all.iloc[val_idx]
+        y_tr = y.iloc[train_idx]
+        y_va = y.iloc[val_idx]
+
+        # Build loaders for this fold
+        X_tr_t = torch.from_numpy(X_tr.values).float()
+        X_va_t = torch.from_numpy(X_va.values).float()
+        y_tr_t = torch.from_numpy(y_tr.values.astype(np.float32))
+        y_va_t = torch.from_numpy(y_va.values.astype(np.float32))
+
+        train_ds = TensorDataset(X_tr_t, y_tr_t)
+        val_ds = TensorDataset(X_va_t, y_va_t)
+
+        train_loader = DataLoader(train_ds, batch_size=nn_cfg.batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=nn_cfg.batch_size, shuffle=False)
+
+        # Build a fresh model for each fold
+        model = MLP(
+            input_dim=input_dim,
+            hidden_sizes=nn_cfg.hidden_sizes,
+            dropout=nn_cfg.dropout
+        )
+
+        model, best_val_acc = train_model(model, train_loader, val_loader, nn_cfg)
+        print(f"Fold {fold_idx} best val accuracy: {best_val_acc:.4f}")
+
+        fold_accuracies.append(best_val_acc)
+        fold_models.append(model)
+
+    mean_acc = sum(fold_accuracies) / len(fold_accuracies)
+    print(f"\n===== Mean 5-Fold Validation Accuracy: {mean_acc:.4f} =====")
+
+    print("\nGenerating test predictions via 5-fold model averaging...")
+    X_test_t = torch.from_numpy(X_test.values).float().to(DEVICE)
+
+    all_probs = []
+
+    for m in fold_models:
+        m.to(DEVICE)
+        m.eval()
+        with torch.no_grad():
+            logits = m(X_test_t)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+
+    probs = np.mean(np.stack(all_probs, axis=0), axis=0)
 
     preds = (probs >= 0.5).astype(int)
 
