@@ -6,10 +6,7 @@ from typing import Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-
-from sklearn.model_selection import StratifiedKFold
-
+from sklearn.model_selection import train_test_split, StratifiedKFold
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -29,32 +26,45 @@ class NNConfig:
     lr: float = 2e-4
     weight_decay: float = 1e-3
     epochs: int = 80
-    hidden_sizes: Tuple[int, ...] = (128, 64)
-    dropout: float = 0.5
+    hidden_sizes: Tuple[int, ...] = (128, 64) # Unused by ResNet but kept for compatibility
+    dropout: float = 0.3
     val_size: float = 0.2
     random_state: int = 42
 
-
-class MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_sizes: Sequence[int], dropout: float = 0.0) -> None:
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim, dropout=0.0):
         super().__init__()
-        layers: list[nn.Module] = []
-        prev_dim = input_dim
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Dropout(dropout)
+        )
 
-        for h in hidden_sizes:
-            layers.append(nn.Linear(prev_dim, h))
-            layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.LeakyReLU(negative_slope=0.01))
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            prev_dim = h
+    def forward(self, x):
+        return x + self.block(x)
 
-        layers.append(nn.Linear(prev_dim, 1))
-        self.net = nn.Sequential(*layers)
+class ResNetTabular(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_blocks=3, dropout=0.2):
+        super().__init__()
+        self.embedding = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+        self.blocks = nn.Sequential(*[
+            ResidualBlock(hidden_dim, dropout) for _ in range(num_blocks)
+        ])
+        self.head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Returns raw logits; apply sigmoid outside when needed
-        return self.net(x).squeeze(-1)
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.blocks(x)
+        return self.head(x).squeeze(-1)
 
 def load_raw_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     root = Path(__file__).resolve().parents[1]
@@ -64,35 +74,18 @@ def load_raw_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     test_df = pd.read_csv(data_dir / "test.csv")
     
     train_df, test_df = global_feature_engineering(train_df, test_df)
-    
     y = train_df["Transported"].astype(int)
 
     return train_df, test_df, y
 
-
 def build_feature_pipeline():
     config = FeatureSelectionConfig(
         numerical_features=[
-            "Age",
-            "RoomService",
-            "FoodCourt",
-            "ShoppingMall",
-            "Spa",
-            "VRDeck",
-            "TotalSpending",
-            "GroupSize",
-            "FamilySize",
-            "Num",
-            "CabinRegion",
+            "Age", "RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck", 
+            "TotalSpending", "GroupSize", "FamilySize", "Num", "CabinRegion",
         ],
         categorical_features=[
-            "HomePlanet",
-            "CryoSleep",
-            "Destination",
-            "VIP",
-            "Deck",
-            "Side",
-            "IsSolo",
+            "HomePlanet", "CryoSleep", "Destination", "VIP", "Deck", "Side", "IsSolo",
         ],
         poly_degree=1,
         k_best=0, 
@@ -101,111 +94,111 @@ def build_feature_pipeline():
     pipe = make_feature_pipeline(config, columns_to_drop=columns_to_drop)
     return pipe
 
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    running_loss = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        optimizer.zero_grad()
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * xb.size(0)
+    return running_loss / len(loader.dataset)
 
-def make_loaders(X: np.ndarray, y: pd.Series, cfg: NNConfig) -> tuple[DataLoader, DataLoader]:
-    X_train, X_val, y_train, y_val = train_test_split(
-        X,
-        y.values,
-        test_size=cfg.val_size,
-        random_state=cfg.random_state,
-        stratify=y,
-    )
+@torch.no_grad()
+def evaluate(model, loader, criterion):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        val_loss += loss.item() * xb.size(0)
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).float()
+        correct += (preds == yb).sum().item()
+        total += yb.numel()
+    return val_loss / len(loader.dataset), correct / total if total > 0 else 0.0
 
-    X_train_t = torch.from_numpy(X_train).float()
-    X_val_t = torch.from_numpy(X_val).float()
-    y_train_t = torch.from_numpy(y_train.astype(np.float32))
-    y_val_t = torch.from_numpy(y_val.astype(np.float32))
-
-    train_ds = TensorDataset(X_train_t, y_train_t)
-    val_ds = TensorDataset(X_val_t, y_val_t)
-
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
-
-    return train_loader, val_loader
-
-
-def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, cfg: NNConfig) -> tuple[nn.Module, float]:
+def run_training_fold(model, train_loader, val_loader, cfg):
     model.to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
+    
     best_val_acc = 0.0
-    best_state: dict | None = None
-
+    best_state = None
+    
     for epoch in range(1, cfg.epochs + 1):
-        model.train()
-        running_loss = 0.0
-        for xb, yb in train_loader:
-            xb = xb.to(DEVICE)
-            yb = yb.to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * xb.size(0)
-
-        train_loss = running_loss / len(train_loader.dataset)
-
-        model.eval()
-        train_correct = 0
-        train_total = 0
-        with torch.no_grad():
-            for xb, yb in train_loader:
-                xb = xb.to(DEVICE)
-                yb = yb.to(DEVICE)
-                logits = model(xb)
-                probs = torch.sigmoid(logits)
-                preds = (probs >= 0.5).float()
-                train_correct += (preds == yb).sum().item()
-                train_total += yb.numel()
-        train_acc = train_correct / train_total if train_total > 0 else 0.0
-        model.train()
-
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(DEVICE)
-                yb = yb.to(DEVICE)
-
-                logits = model(xb)
-                loss = criterion(logits, yb)
-                val_loss += loss.item() * xb.size(0)
-
-                probs = torch.sigmoid(logits)
-                preds = (probs >= 0.5).float()
-                correct += (preds == yb).sum().item()
-                total += yb.numel()
-
-        val_loss /= len(val_loader.dataset)
-        val_acc = correct / total if total > 0 else 0.0
-
-        print(
-            f"Epoch {epoch:3d}/{cfg.epochs} | "
-            f"train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} | val_acc={val_acc:.4f}"
-        )
-
+        train_loss = train_epoch(model, train_loader, optimizer, criterion)
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-
+            
     if best_state is not None:
         model.load_state_dict(best_state)
-
+        
     return model, best_val_acc
+
+def run_kfold(X_all, y_all, nn_cfg):
+    """Runs 5-Fold CV and returns the list of trained models and mean accuracy."""
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_accuracies = []
+    fold_models = []
+    input_dim = X_all.shape[1]
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_all, y_all), start=1):
+        print(f"\n--- Fold {fold_idx} ---")
+        
+        X_tr = X_all.iloc[train_idx]
+        X_va = X_all.iloc[val_idx]
+        y_tr = y_all.iloc[train_idx]
+        y_va = y_all.iloc[val_idx]
+
+        # Prepare Tensors
+        X_tr_t = torch.from_numpy(X_tr.values).float()
+        X_va_t = torch.from_numpy(X_va.values).float()
+        y_tr_t = torch.from_numpy(y_tr.values.astype(np.float32))
+        y_va_t = torch.from_numpy(y_va.values.astype(np.float32))
+
+        train_ds = TensorDataset(X_tr_t, y_tr_t)
+        val_ds = TensorDataset(X_va_t, y_va_t)
+        
+        train_loader = DataLoader(train_ds, batch_size=nn_cfg.batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=nn_cfg.batch_size, shuffle=False)
+
+        model = ResNetTabular(input_dim=input_dim, hidden_dim=256, num_blocks=3, dropout=nn_cfg.dropout)
+        model, best_acc = run_training_fold(model, train_loader, val_loader, nn_cfg)
+        
+        print(f"Fold {fold_idx} Best Acc: {best_acc:.4f}")
+        fold_accuracies.append(best_acc)
+        fold_models.append(model)
+
+    return fold_models, sum(fold_accuracies) / len(fold_accuracies)
+
+def predict_test(models, X_test):
+    """Averages predictions from multiple models."""
+    X_test_t = torch.from_numpy(X_test.values).float().to(DEVICE)
+    all_probs = []
+    
+    for m in models:
+        m.to(DEVICE)
+        m.eval()
+        with torch.no_grad():
+            logits = m(X_test_t)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+            
+    return np.mean(np.stack(all_probs, axis=0), axis=0)
 
 def main() -> None:
     np.random.seed(42)
     torch.manual_seed(42)
-
     print(f"Using device: {DEVICE}")
 
     train_df, test_df, y = load_raw_data()
@@ -214,83 +207,52 @@ def main() -> None:
     print("Fitting feature pipeline...")
     X_all = pipe.fit_transform(train_df, y)
     X_test = pipe.transform(test_df)
-
     print(f"Feature matrix shape: {X_all.shape}")
 
     nn_cfg = NNConfig()
 
-    print("Running 5-fold Stratified K-Fold NN Training...")
+    # --- ROUND 1: Initial Training ---
+    print("\n=== Starting Round 1: Standard 5-Fold CV ===")
+    models, mean_acc = run_kfold(X_all, y, nn_cfg)
+    print(f"\nRound 1 Mean Accuracy: {mean_acc:.4f}")
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    fold_accuracies = []
-    fold_models = []
+    # Generate Predictions
+    probs = predict_test(models, X_test)
 
-    input_dim = X_all.shape[1]
+    # --- ROUND 2: Pseudo-Labeling ---
+    # Select samples where confidence > 99% or < 1%
+    high_conf_idx = np.where((probs > 0.99) | (probs < 0.01))[0]
+    
+    if len(high_conf_idx) > 0:
+        print(f"\n=== Starting Round 2: Pseudo-Labeling with {len(high_conf_idx)} samples ===")
+        
+        X_pseudo = X_test.iloc[high_conf_idx]
+        
+        # FIX: Use the PREDICTED labels, not the training labels
+        pseudo_labels = (probs[high_conf_idx] >= 0.5).astype(int)
+        y_pseudo = pd.Series(pseudo_labels)
+        
+        # Combine Train + Pseudo
+        X_total = pd.concat([X_all, X_pseudo], axis=0).reset_index(drop=True)
+        y_total = pd.concat([y, y_pseudo], axis=0).reset_index(drop=True)
+        
+        # Retrain
+        models, mean_acc = run_kfold(X_total, y_total, nn_cfg)
+        print(f"\nRound 2 (Pseudo) Mean Accuracy: {mean_acc:.4f}")
+        
+        # Re-predict with improved models
+        probs = predict_test(models, X_test)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_all, y), start=1):
-        print(f"\n===== Fold {fold_idx} =====")
-
-        X_tr = X_all.iloc[train_idx]
-        X_va = X_all.iloc[val_idx]
-        y_tr = y.iloc[train_idx]
-        y_va = y.iloc[val_idx]
-
-        # Build loaders for this fold
-        X_tr_t = torch.from_numpy(X_tr.values).float()
-        X_va_t = torch.from_numpy(X_va.values).float()
-        y_tr_t = torch.from_numpy(y_tr.values.astype(np.float32))
-        y_va_t = torch.from_numpy(y_va.values.astype(np.float32))
-
-        train_ds = TensorDataset(X_tr_t, y_tr_t)
-        val_ds = TensorDataset(X_va_t, y_va_t)
-
-        train_loader = DataLoader(train_ds, batch_size=nn_cfg.batch_size, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=nn_cfg.batch_size, shuffle=False)
-
-        # Build a fresh model for each fold
-        model = MLP(
-            input_dim=input_dim,
-            hidden_sizes=nn_cfg.hidden_sizes,
-            dropout=nn_cfg.dropout
-        )
-
-        model, best_val_acc = train_model(model, train_loader, val_loader, nn_cfg)
-        print(f"Fold {fold_idx} best val accuracy: {best_val_acc:.4f}")
-
-        fold_accuracies.append(best_val_acc)
-        fold_models.append(model)
-
-    mean_acc = sum(fold_accuracies) / len(fold_accuracies)
-    print(f"\n===== Mean 5-Fold Validation Accuracy: {mean_acc:.4f} =====")
-
-    print("\nGenerating test predictions via 5-fold model averaging...")
-    X_test_t = torch.from_numpy(X_test.values).float().to(DEVICE)
-
-    all_probs = []
-
-    for m in fold_models:
-        m.to(DEVICE)
-        m.eval()
-        with torch.no_grad():
-            logits = m(X_test_t)
-            probs = torch.sigmoid(logits).cpu().numpy()
-            all_probs.append(probs)
-
-    probs = np.mean(np.stack(all_probs, axis=0), axis=0)
-
+    # --- Submission ---
     preds = (probs >= 0.5).astype(int)
-
     root = Path(__file__).resolve().parents[1]
     out_path = root / "spaceship-titanic" / "submission_nn.csv"
-    submission = pd.DataFrame(
-        {
-            "PassengerId": test_df["PassengerId"],
-            "Transported": preds.astype(bool),
-        }
-    )
+    submission = pd.DataFrame({
+        "PassengerId": test_df["PassengerId"],
+        "Transported": preds.astype(bool),
+    })
     submission.to_csv(out_path, index=False)
     print(f"Wrote neural-network submission to {out_path}")
-
 
 if __name__ == "__main__":
     main()

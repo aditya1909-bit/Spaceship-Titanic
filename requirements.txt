@@ -15,6 +15,7 @@ kaggle
 xgboost
 lightgbm
 catboost
+optuna
 
 # Deep learning
 torch

@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import json
+import os
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
@@ -9,18 +11,30 @@ from catboost import CatBoostClassifier
 
 from feature_selection import FeatureSelectionConfig, make_feature_pipeline, global_feature_engineering
 
-
 def build_models() -> dict[str, object]:
     models: dict[str, object] = {}
     
-    models["lightgbm"] = LGBMClassifier(
-        n_estimators = 1000,
-        learning_rate = 0.05,
-        num_leaves = 31,
-        objective = 'binary',
-        random_state = 42,
-        verbose = -1,
-    )
+    # 1. Try to load optimized LGBM params
+    lgbm_params_path = "spaceship-titanic/lgbm_params.json"
+    if os.path.exists(lgbm_params_path):
+        print(f"Loading tuned LGBM parameters from {lgbm_params_path}...")
+        with open(lgbm_params_path, "r") as f:
+            lgbm_params = json.load(f)
+        # Ensure required non-tunable params are present
+        lgbm_params["objective"] = "binary"
+        lgbm_params["random_state"] = 42
+        lgbm_params["verbose"] = -1
+        models["lightgbm"] = LGBMClassifier(**lgbm_params)
+    else:
+        print("No tuned parameters found. Using defaults for LGBM.")
+        models["lightgbm"] = LGBMClassifier(
+            n_estimators = 1000,
+            learning_rate = 0.05,
+            num_leaves = 31,
+            objective = 'binary',
+            random_state = 42,
+            verbose = -1,
+        )
     
     models["cat"] = CatBoostClassifier(
         iterations=1000,
